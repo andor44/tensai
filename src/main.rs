@@ -1,9 +1,12 @@
 extern crate tensai;
+extern crate debug;
+
+use std::os;
 
 fn main() {
 	println!("Hello world!");
-
-    let torrent = tensai::parse_torrent(&Path::new("/home/andor/test.torrent")).unwrap();
+    let filename = os::args().get(1).to_string();
+    let torrent = tensai::parse_torrent(&Path::new(filename)).unwrap();
     match torrent.metainfo.multifile {
         Some(ref files) => {
             for file in files.iter() {
