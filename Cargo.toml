@@ -1,0 +1,21 @@
+[package]
+name = "tensai"
+version = "0.0.1"
+authors = [ "andor44@gmail.com" ]
+
+
+[dependencies.bencode]
+git = "https://github.com/arjantop/rust-bencode"
+
+
+[dependencies.rust-crypto]
+git = "https://github.com/DaGenix/rust-crypto"
+
+
+[[lib]]
+name = "tensai"
+path = "src/lib.rs"
+
+
+[[bin]]
+name = "daruku"
