@@ -1,38 +1,23 @@
 extern crate tensai;
-extern crate debug;
+extern crate http;
 
 use std::os;
-use std::num::ToStrRadix;
 
-use tensai::torrent::TorrentInfo;
+use tensai::torrent::{Torrent, TorrentInfo};
+use tensai::torrent::{Stopped};
+use tensai::client::Client;
 
 fn main() {
-	println!("Hello world!");
+	println!("Daruku start");
+    println!("Tensai version {}", tensai::CLIENT_VERSION);
     let filename = os::args().get(1).to_string();
     let torrent = TorrentInfo::read(&Path::new(filename)).unwrap();
-    println!("{}", to_hex(torrent.infohash.as_slice()));
-    /*match torrent.metainfo.multifile {
-        Some(ref files) => {
-            for file in files.iter() {
-                println!("{:?}", file);
-                let filepath = file.path.clone();
-                println!("{:?}", filepath.unwrap().get(0));
-            }
-        },
-        _ => ()
-    }*/
+    println!("{}", torrent.hash_string());
+    println!("{}", torrent.urlencoded_hash());
+    let t = Torrent { info: torrent.clone(), status: Stopped };
+    println!("{}", t.scrape().unwrap());
     println!("{}", torrent.comment.clone().map_or(String::from_str("no comment"), |comment| comment));
-    println!("{:?}", torrent);
-}
-
-fn to_hex(rr: &[u8]) -> String {
-    let mut s = String::new();
-    for b in rr.iter() {
-        let hex = (*b as uint).to_str_radix(16u);
-        if hex.len() == 1 {
-            s.push_char('0');
-        }
-        s.push_str(hex.as_slice());
-    }
-    return s;
+    let c = Client::new();
+    let c2 = Client::with_client_rand("foobar");
+    println!("{}", c.peer_id());
 }
