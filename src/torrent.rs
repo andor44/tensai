@@ -5,26 +5,35 @@ extern crate curl;
 
 use std::io::{File};
 use std::num::ToStrRadix;
-use std::io::net::ip::SocketAddr;
-use std::io::net::tcp::{TcpStream, TcpListener, TcpAcceptor};
 use std::str::raw::from_utf8_owned;
+use std::iter::AdditiveIterator;
+use std::rand::task_rng;
 use url::Url;
 
 use bencode::{FromBencode, Dict, Key, Bencode, List, ByteString, Number};
 use crypto::digest::Digest;
 use crypto::sha1::Sha1;
 
+use super::{random_string, opt_finder};
 use scrape::{TorrentScrape, ScrapeInfo};
+use peer::Peer;
+use announce::{AnnounceResponse, AnnounceResult};
 
 
-#[deriving(Clone)]
+#[deriving(Clone, Show)]
 pub struct FileInfo {
-    pub length: int,
+    pub length: uint,
     pub md5sum: Option<String>,
     pub path: Option<Vec<String>>
 }
 
-#[deriving(Clone)]
+#[deriving(Clone, Show)]
+pub enum Payload {
+    SingleFile(FileInfo),
+    MultiFile(Vec<FileInfo>)
+}
+
+#[deriving(Clone, Show)]
 pub struct MetaInfo {
     pub piece_length: int,
     pub pieces: Vec<u8>,
@@ -32,11 +41,10 @@ pub struct MetaInfo {
 
     pub name: String,
 
-    pub single_file: Option<FileInfo>,
-    pub multifile: Option<Vec<FileInfo>>
+    pub payload: Payload,
 }
 
-#[deriving(Clone)]
+#[deriving(Clone, Show)]
 pub struct TorrentInfo {
     pub announce: String,
     pub announce_list: Option<Vec<String>>,
@@ -49,13 +57,7 @@ pub struct TorrentInfo {
     pub infohash: Vec<u8>
 }
 
-fn opt_finder<T: FromBencode>(dict: &Dict, key: &str) -> Option<T> {
-    match dict.find(&Key::from_str(key)) {
-        Some(value) => FromBencode::from_bencode(value),
-        _ => None
-    }
-}
-
+#[allow(dead_code)]
 fn opt_finder_key<T: FromBencode>(dict: &Dict, key: &Key) -> Option<T> {
     match dict.find(key) {
         Some(value) => FromBencode::from_bencode(value),
@@ -113,8 +115,7 @@ impl FromBencode for TorrentInfo {
                                 pieces: pieces.clone(),
                                 private: private,
                                 name: name,
-                                single_file: None,
-                                multifile: Some(files)
+                                payload: MultiFile(files)
                             }, infohash)
                         }
                         else {
@@ -130,8 +131,7 @@ impl FromBencode for TorrentInfo {
                                 pieces: pieces.clone(),
                                 private: private,
                                 name: name,
-                                single_file: Some(file),
-                                multifile: None
+                                payload: SingleFile(file)
                             }, infohash)
                         }
                     },
@@ -177,6 +177,13 @@ impl TorrentInfo {
         unsafe { url::encode_component(from_utf8_owned(self.infohash.clone()).as_slice()) }
     }
 
+    pub fn payload_size(&self) -> uint {
+        match self.metainfo.payload {
+            SingleFile(ref file) => file.length,
+            MultiFile(ref files) => files.iter().map(|file| file.length).sum()
+        }
+    }
+
 }
 
 fn to_hex(rr: &[u8]) -> String {
@@ -197,15 +204,22 @@ pub enum Status {
     Seeding // The torrent is downloading
 }
 
-pub struct Peer {
-    pub address: SocketAddr
-}
-
 pub struct Torrent {
     pub info: TorrentInfo,
     pub status: Status,
+    pub destination_path: Path,
+    pub traffic: TrafficInfo,
+    pub session: SessionInfo,
 }
 
+pub struct TrafficInfo {
+    pub uploaded_bytes: uint,
+    pub downloaded_bytes: uint,
+}
+
+pub struct SessionInfo {
+    pub peers: Vec<Peer>,
+}
 
 impl Torrent {
     // oh god, i hope this goes away soon
@@ -218,28 +232,51 @@ impl Torrent {
     pub fn scrape(&self) -> Option<TorrentScrape> {
         let mut scrape_url = self._scrape_url();
         scrape_url = scrape_url.append(String::from_str("?info_hash=").append(self.info.urlencoded_hash().as_slice()).as_slice());
-        let response = curl::http::handle().get(scrape_url.as_slice()).exec().unwrap();
+        let response = match curl::http::handle().get(scrape_url.as_slice()).exec() {
+            Ok(response) => response,
+            _ => return None
+        };
         let body = response.get_body().clone();
-        let scrape_result = match bencode::from_vec(Vec::from_slice(body)) {
-            Ok(Dict(ref dict)) => {
-                let filesdict = match dict.find(&Key::from_str("files")) {
-                    Some(&Dict(ref filesdict)) => filesdict,
-                    _ => return None
-                };
-                match filesdict.find(&Key::from_slice(self.info.infohash.as_slice())) {
-                    Some(&Dict(ref torrentinfo)) => {
-                        Some(TorrentScrape {
-                            complete: opt_finder(torrentinfo, "complete").unwrap(),
-                            downloaded: opt_finder(torrentinfo, "downloaded").unwrap(),
-                            incomplete: opt_finder(torrentinfo, "incomplete").unwrap(),
-                            name: opt_finder(torrentinfo, "name")
-                        })
-                    },
-                    _ => None
+        let data = match bencode::from_vec(Vec::from_slice(body)) {
+            Ok(data) => data,
+            _ => return None
+        };
+        let scrape: ScrapeInfo = match FromBencode::from_bencode(&data) {
+            Some(scrape) => scrape,
+            _ => return None
+        };
+        scrape.torrents.find(&self.info.infohash).map(|x| (*x).clone())
+    }
+    pub fn announce(&self, peer_id: String) -> Option<AnnounceResponse> {
+        use announce::{Failure};
+        let mut query = String::from_str("?");
+        for &(key, ref value) in vec![("info_hash", self.info.urlencoded_hash()),
+                                      ("peer_id", peer_id),
+                                      ("port", 44000u.to_str()), 
+                                      ("uploaded", self.traffic.uploaded_bytes.to_str()),
+                                      ("downloaded", self.traffic.downloaded_bytes.to_str()),
+                                      ("left", self.info.payload_size().to_str()),
+                                      ("event", String::from_str("started")),
+                                      ("key", "BqNcyuLEsZ".to_str()),//random_string(10)),
+                                      ("compact", 1u.to_str())].iter() {
+            query.push_str(format!("{}={}&", key, value).as_slice());
+        }
+        let url = self.info.announce.clone().append(query.as_slice());
+        println!("{}", url);
+        let response = match curl::http::handle().get(url.as_slice()).exec() {
+            Ok(response) => response,
+            _ => return None
+        };
+        let body = response.get_body().clone();
+        let announce_response: AnnounceResponse = match bencode::from_vec(Vec::from_slice(body)) {
+            Ok(bencode) => {
+                match FromBencode::from_bencode(&bencode) {
+                    Some(result) => result,
+                    _ => Failure("error".to_str())
                 }
             },
-            _ => None
+            _ => return None
         };
-        scrape_result
+        Some(announce_response)
     }
 }
